@@ -1,0 +1,31 @@
+node_modules/
+dist/
+.env
+*.log
+.idea/
+.vscode/
+coverage/
+
+# Written by scripts/export-swagger.ts for the OpenAPI publishing workflow; contracts/ is committed.
+openapi.json
+openapi.yaml
+!contracts/openapi.json
+
+# Reports written by the security / performance tests
+.zap/*.html
+.zap/*.json
+.zap/*.md
+zap.yaml
+summary.json
+
+# mairie360/CICD checkout (shared ZAP / k6 test files), cloned by security_test.sh and
+# performance_test.sh, and by the CI jobs.
+cicd-repo/
+
+# newman junit report of docker-compose-integration.yml (integration_test.sh)
+newman-reports/
+
+# GDPR log marker report (gdpr_marker_test.sh, MAIR-290): raw container logs, never committed.
+/gdpr-report/
+# GDPR usage simulation run (gdpr_simulation_test.sh, MAIR-497): raw logs, never committed.
+/gdpr-simulation/

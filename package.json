@@ -1,0 +1,43 @@
+{
+  "name": "bff-template",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "tsx watch src/index.ts",
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix",
+    "test": "jest",
+    "openapi:extract": "tsx scripts/export-swagger.ts",
+    "contracts:generate": "npm run openapi:extract && node scripts/contracts.mjs --generate",
+    "contracts:check": "npm run openapi:extract -- --check && node scripts/contracts.mjs --check"
+  },
+  "dependencies": {
+    "@asteasolutions/zod-to-openapi": "9.1.0",
+    "@mairie360/bffs-lib": "3.0.0",
+    "axios": "1.21.1",
+    "dotenv": "18.0.10",
+    "express": "5.3.0",
+    "swagger-ui-express": "5.0.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@mairie360/core-api-openapi": "1.2.0",
+    "@types/express": "5.0.6",
+    "@types/jest": "30.0.0",
+    "@types/node": "^26.0.0",
+    "@types/supertest": "7.2.1",
+    "@types/swagger-ui-express": "4.1.8",
+    "@typescript-eslint/eslint-plugin": "8.73.0",
+    "@typescript-eslint/parser": "8.73.0",
+    "esbuild": "0.28.2",
+    "eslint": "10.15.0",
+    "globals": "17.14.0",
+    "jest": "30.5.2",
+    "supertest": "7.3.2",
+    "ts-jest": "29.4.15",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0"
+  }
+}

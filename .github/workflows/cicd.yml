@@ -1,0 +1,31 @@
+# Same pipeline as every BFF. Running it on the template publishes a bff-template image and
+# @mairie360/bff-template-openapi package, so the template is linted, tested, scanned (ZAP, k6) and
+# released exactly like the BFFs generated from it. In a new BFF: set the workflow name and
+# package_name (lines marked #change bff name).
+name: BFF Template CICD #change bff name
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Every permission a job of the reusable pipeline requests must be granted here, or GitHub refuses to
+# start the run (startup_failure): release-dev signs the image with cosign keyless (id-token: write).
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  CICD:
+    uses: mairie360/CICD/.github/workflows/BFFs-cicd.yml@v5.14.3
+    with:
+      package_name: bff-template #change bff name
+      node_version: "26"
+      cicd_version: v5.14.3
+      openapi_spec_path: contracts/openapi.json
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      N8N_WEBHOOK_SECRET: ${{ secrets.N8N_WEBHOOK_SECRET }}
+      ANTHROPIC_REVIEW_API_KEY: ${{ secrets.ANTHROPIC_REVIEW_API_KEY }}
+      ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}

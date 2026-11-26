@@ -1,0 +1,273 @@
+import axios from 'axios';
+import path from 'node:path';
+import request from 'supertest';
+import app from '../src/app';
+import { ContractMockServer, unreachableUrl, type MockReply } from './support/contract-mock-server';
+import { bearer, coreApiUrls, meResponse, profileOf, tokenOf } from './support/core-fixtures';
+import { OpenApiContract } from './support/openapi-contract';
+import { loadOrvalContract } from './support/orval-contract';
+
+// The whole app is tested with the real axios client against a real HTTP server mocking Core API. Its
+// contract is rebuilt from the installed @mairie360/core-api-openapi package (version pinned in
+// package.json): the mock rejects routes, parameters and bodies absent from the contract and validates
+// its success answers. Errors are not typed by orval: every mocked error reply is marked
+// `outOfContract`. Every BFF answer is validated against contracts/openapi.json.
+
+const coreApi = new ContractMockServer('CORE_API', loadOrvalContract('@mairie360/core-api-openapi'));
+// Templates of the Core API contract (mock keys); the expected concrete paths come from coreApiUrls.
+const CORE = { me: '/api/v1/user/me/', health: '/health' } as const;
+const bffContract = OpenApiContract.load(path.join(__dirname, '..', 'contracts', 'openapi.json'));
+
+beforeAll(async () => { await coreApi.start(); });
+afterAll(async () => { await coreApi.stop(); });
+beforeEach(() => {
+  coreApi.reset();
+  // baseUrl() reads CORE_API_URL and CORE_API_PORT on every request: no module reload needed.
+  const url = new URL(coreApi.url);
+  process.env.CORE_API_URL = url.hostname;
+  process.env.CORE_API_PORT = url.port;
+});
+afterEach(() => {
+  expect(coreApi.violations).toEqual([]);
+});
+
+function expectBffContract(method: string, pathname: string, response: request.Response) {
+  const match = bffContract.match(method, pathname);
+  expect(match?.template).toBeDefined();
+  const { documented, schema } = bffContract.responseSchema(match!, response.status);
+  expect({ status: response.status, documented }).toEqual({ status: response.status, documented: true });
+  if (schema && response.type === 'application/json') expect(bffContract.validate(schema, response.body)).toEqual([]);
+}
+
+/** Core API error: not typed by orval, hence out of contract. Core answers plain text (actix ResponseError). */
+const coreError = (status: number, raw = 'An error occurred while accessing the database.'): MockReply =>
+  ({ status, raw, contentType: 'text/plain; charset=utf-8', outOfContract: true });
+
+async function withUnreachableCore() {
+  const url = new URL(await unreachableUrl());
+  process.env.CORE_API_URL = url.hostname;
+  process.env.CORE_API_PORT = url.port;
+}
+
+const profile = (authorization?: string) => {
+  const call = request(app).get('/example/profile');
+  return authorization ? call.set('Authorization', authorization) : call;
+};
+
+describe('GET /example/profile with a contract-driven Core API mock', () => {
+  test('forwards the caller session to GET /api/v1/user/me/ and only exposes the profile fields', async () => {
+    const me = meResponse();
+    coreApi.on('get', CORE.me, { body: me });
+
+    const response = await profile(bearer('session-42'));
+
+    expect(response.status).toBe(200);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(response.body).toEqual(profileOf(me));
+    expect(coreApi.requests.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([`GET ${coreApiUrls.getGetMeUrl()}`]);
+    expect(coreApi.requests[0].headers.authorization).toBe(bearer('session-42'));
+    expect(coreApi.requests[0].headers.accept).toBe('application/json');
+  });
+
+  test.each([
+    ['no Authorization header', undefined],
+    ['a non-Bearer scheme', 'Basic YW5uZTpzZWNyZXQ='],
+    ['an empty Bearer token', 'Bearer '],
+  ])('answers 401 without calling Core for %s', async (_label, authorization) => {
+    const response = await profile(authorization);
+
+    expect(response.status).toBe(401);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.body).toEqual({ error: { code: 'UNAUTHORIZED', message: 'Invalid session.', details: [] } });
+    expect(coreApi.requests).toHaveLength(0);
+  });
+
+  test.each([
+    ['an accessToken cookie', 'Cookie', 'accessToken=session-42'],
+    ['a session cookie', 'Cookie', 'session=session-42'],
+    ['an x-session-token header', 'x-session-token', 'session-42'],
+  ])('ignores %s: only the Bearer header is a session (401, no Core call)', async (_label, header, value) => {
+    const response = await request(app).get('/example/profile').set(header, value);
+
+    expect(response.status).toBe(401);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(coreApi.requests).toHaveLength(0);
+  });
+
+  test('forwards the session normalised to `Bearer <token>`', async () => {
+    coreApi.on('get', CORE.me, { body: meResponse() });
+
+    const response = await profile(`bearer   ${tokenOf('session-42')}`);
+
+    expect(response.status).toBe(200);
+    expect(coreApi.requests[0].headers.authorization).toBe(`Bearer ${tokenOf('session-42')}`);
+  });
+
+  test.each([
+    [401, 'UNAUTHORIZED', 'Authentication required'],
+    [404, 'NOT_FOUND', 'Resource not found'],
+  ])('keeps a declared Core %i with a generic message', async (status, code, message) => {
+    coreApi.on('get', CORE.me, coreError(status, 'Unauthorized'));
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(status);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.body).toEqual({ error: { code, message, details: [] } });
+  });
+
+  test.each([403, 409, 422])('turns an undeclared Core %i into a 502', async (status) => {
+    coreApi.on('get', CORE.me, coreError(status, 'Forbidden'));
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(502);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.body).toEqual({ error: { code: 'BAD_GATEWAY', message: 'Upstream service error', details: [] } });
+  });
+
+  test('turns a Core 500 into a 502 without relaying its body', async () => {
+    coreApi.on('get', CORE.me, coreError(500));
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(502);
+    expectBffContract('get', '/example/profile', response);
+    expect(JSON.stringify(response.body)).not.toContain('database');
+  });
+
+  // MAIR-290: the cause of an upstream 502 is the axios error, which holds the caller's Bearer token and the
+  // upstream answer. Whatever the BFF writes about the failure (JSON log lines on stdout, stderr, console)
+  // describes it by its type and status, never by these values.
+  test('MAIR-290 logs an upstream failure without the token or the upstream body', async () => {
+    const written: string[] = [];
+    const keep = ((chunk: string | Uint8Array) => {
+      written.push(String(chunk));
+      return true;
+    });
+    jest.spyOn(process.stdout, 'write').mockImplementation(keep as typeof process.stdout.write);
+    jest.spyOn(process.stderr, 'write').mockImplementation(keep as typeof process.stderr.write);
+    for (const level of ['log', 'info', 'warn', 'error', 'debug'] as const) {
+      jest.spyOn(console, level).mockImplementation((...args: unknown[]) => {
+        written.push(args.map((arg) => (arg instanceof Error ? `${arg.stack} ${JSON.stringify(arg)}` : typeof arg === 'string' ? arg : JSON.stringify(arg))).join(' '));
+      });
+    }
+    try {
+      const token = tokenOf('session-jeanne-marker-290');
+      coreApi.on('get', CORE.me, coreError(500, 'No profile for jeanne.marker290@example.org, 06 12 34 56 78'));
+
+      const response = await profile(`Bearer ${token}`);
+
+      expect(response.status).toBe(502);
+      const logs = written.join('\n');
+      expect(logs).toContain('502');
+      for (const value of [token, 'jeanne.marker290@example.org', '06 12 34 56 78']) {
+        expect(logs).not.toContain(value);
+      }
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
+  test('retries the idempotent GET once after a transient Core 503', async () => {
+    const me = meResponse();
+    let calls = 0;
+    coreApi.on('get', CORE.me, () => (calls++ === 0 ? coreError(503, 'Service Unavailable') : { body: me }));
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(200);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.body).toEqual(profileOf(me));
+    expect(coreApi.requests).toHaveLength(2);
+  });
+
+  test('does not retry a Core 500 (not transient)', async () => {
+    coreApi.on('get', CORE.me, coreError(500));
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(502);
+    expect(coreApi.requests).toHaveLength(1);
+  });
+
+  test('answers 502 when Core answers a body without the profile fields', async () => {
+    coreApi.on('get', CORE.me, { body: { email: 'anne@mairie.test' }, outOfContract: true });
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(502);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.body).toEqual({ error: { code: 'BAD_GATEWAY', message: 'The CORE_API answer is invalid.', details: [] } });
+  });
+
+  test('answers 502 when Core API is unreachable', async () => {
+    await withUnreachableCore();
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(502);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.body).toEqual({ error: { code: 'BAD_GATEWAY', message: 'The CORE_API service is unavailable.', details: [] } });
+  });
+
+  test('answers 503 when Core API is not configured', async () => {
+    delete process.env.CORE_API_URL;
+
+    const response = await profile(bearer());
+
+    expect(response.status).toBe(503);
+    expectBffContract('get', '/example/profile', response);
+    expect(response.body).toEqual({ error: { code: 'SERVICE_UNAVAILABLE', message: 'The CORE_API service is not configured.', details: [] } });
+  });
+
+  test('checks the session before the configuration: 401 without one, even when Core API is not configured', async () => {
+    delete process.env.CORE_API_URL;
+
+    const response = await profile();
+
+    expect(response.status).toBe(401);
+    expectBffContract('get', '/example/profile', response);
+  });
+});
+
+describe('GET /check_apis', () => {
+  test('answers 200 when Core API is healthy', async () => {
+    coreApi.on('get', CORE.health, { status: 200 });
+
+    const response = await request(app).get('/check_apis');
+
+    expect(response.status).toBe(200);
+    expectBffContract('get', '/check_apis', response);
+    expect(response.body).toEqual({ status: 'OK', core_api: 'Connected' });
+    expect(coreApi.requests[0].headers.authorization).toBeUndefined();
+  });
+
+  test('answers 502 when Core API is unreachable', async () => {
+    await withUnreachableCore();
+
+    const response = await request(app).get('/check_apis');
+
+    expect(response.status).toBe(502);
+    expectBffContract('get', '/check_apis', response);
+    expect(response.body).toEqual({ status: 'Error', core_api: 'Unreachable' });
+  });
+
+  test('reports Core API unreachable without calling any default host when it is not configured', async () => {
+    delete process.env.CORE_API_URL;
+    const requestSpy = jest.spyOn(axios.Axios.prototype, 'request');
+
+    try {
+      const response = await request(app).get('/check_apis');
+
+      expect(response.status).toBe(502);
+      expectBffContract('get', '/check_apis', response);
+      expect(response.body).toEqual({ status: 'Error', core_api: 'Unreachable' });
+      expect(requestSpy).not.toHaveBeenCalled();
+    } finally {
+      requestSpy.mockRestore();
+    }
+  });
+});
